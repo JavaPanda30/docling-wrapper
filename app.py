@@ -1,5 +1,8 @@
 from flask import Flask, request, render_template, jsonify, send_file
 from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import PdfFormatOption
 from pydantic import BaseModel, ValidationError, field_validator
 import tempfile
 import os
@@ -9,6 +12,16 @@ from typing import Optional, Union
 import re
 from werkzeug.utils import secure_filename
 import io
+
+# Set environment variables for better PyTorch stability
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+
+# Configure PyTorch for CPU usage and stability
+torch.set_num_threads(1)
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
@@ -20,7 +33,22 @@ ALLOWED_EXTENSIONS = {
     'html', 'htm', 'txt', 'md', 'rtf', 'odt', 'epub'
 }
 
-converter = DocumentConverter()
+# Configure Docling with minimal pipeline options to avoid tensor errors
+try:
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = False  # Disable OCR to reduce memory usage
+    pipeline_options.do_table_structure = False  # Disable table structure to avoid tensor issues
+    
+    # Create converter with configuration
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+        }
+    )
+except Exception as e:
+    # Fallback to basic converter if configuration fails
+    print(f"Warning: Failed to configure advanced options, using basic converter: {e}")
+    converter = DocumentConverter()
 
 # Pydantic models for input validation
 class TextInput(BaseModel):
@@ -56,12 +84,48 @@ def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def safe_convert_document(filepath):
+    """
+    Attempt document conversion with fallback strategies
+    """
+    try:
+        # First attempt: use configured converter
+        with torch.no_grad():
+            result = converter.convert(filepath)
+            return result.document.export_to_markdown()
+    except Exception as e:
+        print(f"Primary conversion failed: {e}")
+        
+        try:
+            # Second attempt: use basic converter
+            basic_converter = DocumentConverter()
+            with torch.no_grad():
+                result = basic_converter.convert(filepath)
+                return result.document.export_to_markdown()
+        except Exception as e2:
+            print(f"Fallback conversion failed: {e2}")
+            
+            # Third attempt: try with text extraction only
+            try:
+                # For text files, read directly
+                if filepath.lower().endswith(('.txt', '.md')):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        return f.read()
+                else:
+                    raise Exception("Text extraction not supported for this file type")
+            except Exception as e3:
+                raise Exception(f"All conversion methods failed. Last error: {str(e3)}")
+
 @app.route("/")
 def index():
     return render_template("index.html")
 @app.route("/process", methods=["POST"])
 def process():
     try:
+        # Set PyTorch to use CPU only and manage memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # Check if it's a file upload or text input
         if 'file' in request.files and request.files['file'].filename:
             # Handle file upload
@@ -79,11 +143,8 @@ def process():
             file.save(temp_filepath)
             
             try:
-                # Convert with Docling
-                result = converter.convert(temp_filepath)
-                
-                # Extract the document content as markdown string
-                markdown_content = result.document.export_to_markdown()
+                # Convert with Docling using safe conversion method
+                markdown_content = safe_convert_document(temp_filepath)
                 
                 return jsonify({
                     "result": markdown_content,
@@ -91,10 +152,17 @@ def process():
                     "success": True
                 })
             
+            except Exception as conversion_error:
+                app.logger.error(f"Conversion failed for {filename}: {str(conversion_error)}")
+                return jsonify({"error": f"Failed to convert file: {str(conversion_error)}"}), 500
+            
             finally:
                 # Clean up temp file
                 if os.path.exists(temp_filepath):
                     os.unlink(temp_filepath)
+                # Clear any cached tensors
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         else:
             # Handle text input (fallback for backward compatibility)
@@ -125,12 +193,17 @@ def process():
                 tmp.flush()
                 tmp_file_path = tmp.name
 
-            result = converter.convert(tmp_file_path)
-
-            os.unlink(tmp_file_path)
-
-            # Extract the document content as markdown string
-            return jsonify({"result": result.document.export_to_markdown()})
+            try:
+                with torch.no_grad():  # Disable gradient computation
+                    result = converter.convert(tmp_file_path)
+                
+                # Extract the document content as markdown string
+                return jsonify({"result": result.document.export_to_markdown()})
+            
+            finally:
+                os.unlink(tmp_file_path)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     except Exception as e:
         app.logger.exception("Processing failed")
